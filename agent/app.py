@@ -5794,7 +5794,7 @@ with tab_cmp:
 
                 # Download as xlsx
                 _q_xlsx_buf = io.BytesIO()
-                _q_df.to_excel(_q_xlsx_buf, index=False)
+                _q_df.to_excel(_q_xlsx_buf, index=False, engine="openpyxl")
                 st.download_button(
                     "⬇ Download questionnaire xlsx",
                     _q_xlsx_buf.getvalue(),
