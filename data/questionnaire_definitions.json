@@ -1,0 +1,32 @@
+[
+  {
+    "q_id": "Q_MORTALITY_GUARANTEE",
+    "question": "What survival/replacement guarantee do you offer on planted material, and over what period?",
+    "pass_criteria": "\u226580% survival guaranteed, replacement covered, for \u22653 months"
+  },
+  {
+    "q_id": "Q_WATER_RESPONSIBILITY",
+    "question": "Who arranges irrigation/water during the establishment period (first 2-3 months)?",
+    "pass_criteria": "Vendor arranges or co-arranges water supply \u2014 not left entirely to the client's ad hoc tanker access"
+  },
+  {
+    "q_id": "Q_PLANTING_WINDOW",
+    "question": "What's your proposed installation timeline, and does it respect Jaipur's monsoon planting window (roughly July\u2013September, when transplant survival is highest)?",
+    "pass_criteria": "Timeline overlaps the monsoon window, OR vendor proposes a specific compensating irrigation plan if working outside it"
+  },
+  {
+    "q_id": "Q_SOURCING",
+    "question": "Where is your plant material sourced from \u2014 local Rajasthan nurseries or interstate?",
+    "pass_criteria": "Primarily local/regional sourcing for heat-sensitive species; interstate sourcing of ornamental/exotic stock flagged as a survival risk, not an automatic fail"
+  },
+  {
+    "q_id": "Q_SITE_ACCESS",
+    "question": "Do you handle required local permissions (municipal tree-cutting/digging permits, oversized vehicle access) or is that the client's responsibility?",
+    "pass_criteria": "Vendor takes or clearly coordinates responsibility"
+  },
+  {
+    "q_id": "Q_MAINTENANCE_HANDOVER",
+    "question": "What post-installation maintenance period is included before handover, and what does it cover?",
+    "pass_criteria": "\u22651 month included, covering at minimum watering and dead-plant replacement"
+  }
+]

@@ -1,0 +1,29 @@
+# Credentials and secrets — never commit
+config/
+.env
+*.env
+
+# Google Cloud service account keys
+*.json
+!data/rfx_lines.json
+!data/gpt_boq.json
+!data/questionnaire_definitions.json
+!data/vendor_raw/**/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Streamlit local secrets (use Community Cloud secrets UI instead)
+.streamlit/secrets.toml
