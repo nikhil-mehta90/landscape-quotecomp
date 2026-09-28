@@ -200,6 +200,34 @@ def _ensure_app_tables():
             )
         """)
 
+        # Retroactively supersede older rows when the same vendor+rfx+line_id was extracted
+        # from multiple source files (double-counting fix). For each duplicate group, mark
+        # all but the most-recently-extracted source file as superseded.
+        conn.execute("""
+            UPDATE vendor_extractions
+            SET superseded_by = (
+                SELECT ve2.source_file
+                FROM vendor_extractions ve2
+                WHERE ve2.vendor_id   = vendor_extractions.vendor_id
+                  AND ve2.rfx_id      = vendor_extractions.rfx_id
+                  AND ve2.line_id     = vendor_extractions.line_id
+                  AND ve2.source_file != vendor_extractions.source_file
+                  AND (ve2.superseded_by IS NULL OR ve2.superseded_by = '')
+                ORDER BY ve2.extracted_at DESC
+                LIMIT 1
+            )
+            WHERE (superseded_by IS NULL OR superseded_by = '')
+              AND EXISTS (
+                SELECT 1 FROM vendor_extractions ve2
+                WHERE ve2.vendor_id   = vendor_extractions.vendor_id
+                  AND ve2.rfx_id      = vendor_extractions.rfx_id
+                  AND ve2.line_id     = vendor_extractions.line_id
+                  AND ve2.source_file != vendor_extractions.source_file
+                  AND (ve2.superseded_by IS NULL OR ve2.superseded_by = '')
+                  AND ve2.extracted_at > vendor_extractions.extracted_at
+              )
+        """)
+
         conn.commit()
     finally:
         conn.close()
@@ -3794,6 +3822,20 @@ def _run_inbound_extraction(
                         vendor_json.get("extracted_at"),
                         ex.get("granularity", "line_item"),
                     ))
+                # Supersede older rows for the same line_ids from previous source files
+                new_line_ids = [
+                    ex.get("line_id") for ex in vendor_json.get("extractions", [])
+                    if ex.get("line_id") and ex.get("value_source", "extracted") != "unknown"
+                ]
+                if new_line_ids:
+                    _ph = ",".join("?" * len(new_line_ids))
+                    conn.execute(
+                        f"UPDATE vendor_extractions SET superseded_by=? "
+                        f"WHERE vendor_id=? AND rfx_id=? AND source_file!=? "
+                        f"  AND (superseded_by IS NULL OR superseded_by='') "
+                        f"  AND line_id IN ({_ph})",
+                        [src, vendor_id, rfx_id, src] + new_line_ids,
+                    )
                 conn.commit()
                 n_extracted += 1
             finally:
