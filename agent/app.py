@@ -4236,14 +4236,13 @@ def _data_quality_stats(rfx_id: str | None = None):
     SELECT
         ve.vendor_id,
         ve.vendor_name,
-        SUM(CASE WHEN ve.value_source != 'unknown' THEN 1 ELSE 0 END) AS lines_quoted,
-        SUM(CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence >= 0.7
-                 THEN 1 ELSE 0 END) AS ec_high_count,
-        SUM(CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence >= 0.4
-                      AND ve.extraction_confidence < 0.7 THEN 1 ELSE 0 END) AS ec_med_count,
-        SUM(CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence < 0.4
-                 THEN 1 ELSE 0 END) AS ec_low_count,
-        SUM(CASE WHEN ve.value_source = 'unknown' THEN 1 ELSE 0 END) AS not_quoted_count,
+        COUNT(DISTINCT CASE WHEN ve.value_source != 'unknown' THEN ve.line_id END) AS lines_quoted,
+        COUNT(DISTINCT CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence >= 0.7
+                 THEN ve.line_id END) AS ec_high_count,
+        COUNT(DISTINCT CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence >= 0.4
+                      AND ve.extraction_confidence < 0.7 THEN ve.line_id END) AS ec_med_count,
+        COUNT(DISTINCT CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence < 0.4
+                 THEN ve.line_id END) AS ec_low_count,
         SUM(CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence >= 0.7
                  THEN ve.normalized_unit_price * rl.quantity ELSE 0 END) AS val_high,
         SUM(CASE WHEN ve.value_source != 'unknown' AND ve.extraction_confidence >= 0.4
@@ -4274,6 +4273,7 @@ def _data_quality_stats(rfx_id: str | None = None):
         df = df.merge(best_names, on='vendor_id', how='left')
     df["total_rfx_lines"] = total_lines
     df["coverage_pct"] = (df["lines_quoted"] / total_lines * 100).round(1)
+    df["not_quoted_count"] = (total_lines - df["lines_quoted"]).clip(lower=0).astype(int)
     safe_total = df["val_total"].clip(lower=1)
     df["val_high_pct"] = (df["val_high"] / safe_total * 100).round(1)
     df["val_med_pct"]  = (df["val_med"]  / safe_total * 100).round(1)
@@ -4537,7 +4537,7 @@ def _scorecard_data(rfx_id: str | None = None):
 
     coverage = pd.read_sql_query(
         f"SELECT ve.vendor_id, ve.vendor_name, "
-        f"SUM(CASE WHEN ve.value_source != 'unknown' THEN 1 ELSE 0 END) AS lines_quoted "
+        f"COUNT(DISTINCT CASE WHEN ve.value_source != 'unknown' THEN ve.line_id END) AS lines_quoted "
         f"FROM vendor_extractions ve "
         f"WHERE (ve.superseded_by IS NULL OR ve.superseded_by = '') {rfx_clause_ve} "
         f"GROUP BY ve.vendor_id, ve.vendor_name",
