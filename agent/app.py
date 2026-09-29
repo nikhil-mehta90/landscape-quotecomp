@@ -401,13 +401,16 @@ def _schema_summary() -> str:
     - Never compare prices where spec_grade_match='undergrade' or 'overgrade' without noting it
     - 'cheapest' means lowest normalized_unit_price among matched=1 rows with ec >= 0.7
 
-    RULE A — Totals always use BOQ quantity:
-      For any total or cross-vendor cost comparison, multiply normalized_unit_price by
-      rl.quantity (from rfx_lines — the CLIENT's required quantity). NEVER use
-      ve.quantity_quoted (the vendor's own quoted quantity, which varies per vendor and
-      makes cross-vendor totals incomparable).
-      Correct:  SUM(ve.normalized_unit_price * rl.quantity)
-      Wrong:    SUM(ve.normalized_unit_price * ve.quantity_quoted)
+    RULE A — Which quantity to use for totals:
+      (a) CROSS-VENDOR comparison (comparing total cost of vendor A vs B for the same scope):
+          Use rl.quantity (the CLIENT's BOQ quantity) so all vendors are evaluated on the
+          same scope. Correct: SUM(ve.normalized_unit_price * rl.quantity)
+      (b) SINGLE-VENDOR quote total (what did vendor X actually quote / submit in their doc):
+          Use ve.quantity_quoted (the vendor's own submitted quantities). This answers "what
+          did Phoenix quote?" — their document's own quantities, not the BOQ.
+          Correct: SUM(ve.normalized_unit_price * ve.quantity_quoted)
+      When the question names ONE vendor and asks what they quoted/submitted/proposed, use (b).
+      When comparing vendors against each other or against the BOQ, use (a).
 
     RULE B — Questionnaire: always show 4 states, never a single pass-count:
       For ANY questionnaire summary, compute all four states per vendor per question:
@@ -529,6 +532,22 @@ def _schema_summary() -> str:
       NEVER write LIKE '%anything%' SQL for species, items, sections, or vendors directly.
       ALL name-to-ID mapping must go through resolve_lines.
 
+      EXCEPTION — Aggregation/ranking queries (skip resolve_lines entirely):
+        If the user asks for ranking or a top/bottom N WITHOUT naming a specific item
+        (e.g. "top 5 most expensive line items", "5 cheapest lines overall",
+        "highest priced items", "most expensive across all sections"), do NOT call
+        resolve_lines. Instead, write SQL directly:
+          SELECT rl.item_name, rl.section, rl.line_id,
+                 AVG(ve.normalized_unit_price) AS avg_unit_price
+          FROM vendor_extractions ve
+          JOIN rfx_lines rl ON ve.line_id = rl.line_id
+          WHERE ve.rfx_id = ? AND (ve.superseded_by IS NULL OR ve.superseded_by = '')
+            AND ve.matched = 1 AND ve.extraction_confidence >= 0.7
+          GROUP BY rl.line_id, rl.item_name, rl.section
+          ORDER BY avg_unit_price DESC   -- or ASC for cheapest
+          LIMIT 5
+        Use rl.item_name as the label for charts and tables.
+
       Line/item/section queries: resolve_lines(query, entity_type="line")  → line_ids
       Vendor queries:            resolve_lines(query, entity_type="vendor") → vendor_ids
       Use returned IDs in run_query: WHERE line_id IN (...) / WHERE vendor_id IN (...)
@@ -579,6 +598,20 @@ def _schema_summary() -> str:
         SELECT rl.line_id, rl.description, rl.species_name, rl.spec_notes, rl.spec_parsed,
                rl.quantity, rl.unit, rl.boq_unit_rate
         FROM rfx_lines rl WHERE rl.line_id = '<resolved_id>'
+
+    RULE L — Coverage gate before award or optimisation recommendations:
+      Before making any recommendation that names a preferred vendor (awarding, shortlisting,
+      eliminating, or ranking vendors for selection), you MUST:
+      1. Run a coverage check: report each vendor's lines_quoted / total_rfx_lines as a %.
+      2. If ANY vendor has < 60% coverage, show a ⚠️ warning before the recommendation:
+         "⚠️ [Vendor] covers only X% of RFx lines — a full award comparison requires
+         imputed prices for the remaining Y lines or separate negotiation on those items."
+      3. Label all totals with their line scope — NEVER present a partial-coverage total as
+         if it were a full quote. Use e.g. "common-lines total (34/69 lines quoted by all)".
+      4. If the user explicitly asks for a recommendation despite low coverage, give it —
+         but the coverage caveat must still appear before the verdict.
+      This rule applies to: "who should I award to", "best vendor", "eliminate vendor",
+      "optimise cost", "which vendor wins", and any equivalent phrasing.
 
     IMPORTANT — text/keyword search across rfx_lines:
       Always use the 'search_text' column for any text/keyword search on rfx_lines.
@@ -830,6 +863,9 @@ TOOLS = [
                 "Aggregation rule: when the data has 10+ line items (e.g. all BOQ lines), "
                 "aggregate to section level first (GROUP BY section) before charting — "
                 "never plot raw line-level data with 10+ bars. "
+                "Total-cost ranking rule: bar heights for vendor totals MUST be computed as "
+                "SUM(normalized_unit_price * quantity) — never unit price alone or average price. "
+                "Sort labels by this total (ascending = cheapest first) before passing to render_chart. "
                 "The chart automatically adds a median reference line (dashed red) per group "
                 "so above/below-pack vendors are immediately visible."
             ),
@@ -1635,6 +1671,206 @@ _OFF_TOPIC_CHIT_CHAT = frozenset({
 })
 
 
+# ── Conversation-state + grounding helpers ────────────────────────────────────
+
+def _ambiguity_already_resolved(history: list) -> bool:
+    """True if the last assistant turn asked for a choice/clarification, meaning
+    the current user input IS the answer to that question."""
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            content = (msg.get("content") or "").rstrip()
+            if content.endswith("?"):
+                return True
+            # Agent listed options and asked user to pick
+            lower = content.lower()
+            if any(lower.endswith(s) for s in ("choose from:", "from this list:", "clarify:", "from the list:")):
+                return True
+            if "which one" in lower[-200:] or "please clarify" in lower[-200:] or "you can choose" in lower[-200:]:
+                return True
+    return False
+
+
+_GR_INR_RE = re.compile(r'₹\s*([\d,]+(?:\.\d+)?)')
+_GR_COV_RE = re.compile(r'\b(\d{1,3}(?:\.\d+)?)\s*%')
+_GR_NUM_RE = re.compile(r'[\d,]+(?:\.\d+)?')
+
+
+def _parse_num(s: str) -> "float | None":
+    try:
+        return float(str(s).replace(',', '').strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def run_grounding_check(answer_text: str, tool_log: list, conn) -> dict:
+    """
+    Deterministic grounding: verify answer numbers against SQL tool results.
+    Scope: ₹ amounts > 999 and coverage percentages only. No LLM call.
+    Numbers not traceable to any tool result are flagged as unchecked —
+    they must be visibly marked, never silently treated as verified.
+    Returns: {passed, unchecked_numbers, checked_count}
+    """
+    # Collect claimed numbers from answer
+    claimed: dict[str, float] = {}
+    for m in _GR_INR_RE.finditer(answer_text):
+        v = _parse_num(m.group(1))
+        if v and v > 999:
+            claimed[m.group(0)] = v
+    for m in _GR_COV_RE.finditer(answer_text):
+        v = _parse_num(m.group(1))
+        if v and 0 < v <= 100:
+            claimed[m.group(0)] = v
+
+    if not claimed:
+        return {"passed": True, "unchecked_numbers": [], "checked_count": 0}
+
+    # Harvest all numbers visible in run_query tool results
+    tool_numbers: set[float] = set()
+    for entry in tool_log:
+        if entry.get("tool") != "run_query" or entry.get("error"):
+            continue
+        for ns in _GR_NUM_RE.findall(entry.get("result", "")):
+            v = _parse_num(ns)
+            if v and v > 0:
+                tool_numbers.add(v)
+
+    # Match each claimed number to a tool result within 2% tolerance
+    unchecked: list[str] = []
+    checked_count = 0
+    for display_str, val in claimed.items():
+        if any(abs(val - tv) / max(abs(tv), 1.0) < 0.02 for tv in tool_numbers if tv > 0):
+            checked_count += 1
+        else:
+            unchecked.append(display_str)
+
+    return {
+        "passed": len(unchecked) == 0,
+        "unchecked_numbers": unchecked,
+        "checked_count": checked_count,
+    }
+
+
+# ── Component 1b: Complexity assessment ──────────────────────────────────────
+
+def assess_query_complexity(query: str, history: list) -> dict:
+    """
+    Single MODEL_LIGHT call to assess whether the query needs clarification.
+    Only flags needs_clarification if confidence < 0.65 AND ambiguity not already resolved.
+    Returns: {confidence, hop_type, is_judgment, needs_clarification, clarification_question}
+    """
+    if _ambiguity_already_resolved(history):
+        return {"confidence": 1.0, "hop_type": "single", "is_judgment": False,
+                "needs_clarification": False, "clarification_question": None}
+    try:
+        resp = openai_client.chat.completions.create(
+            model=MODEL_LIGHT,
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=200,
+            messages=[{
+                "role": "system",
+                "content": (
+                    "Assess a procurement analyst query's clarity for a landscaping BOQ system. "
+                    "Return JSON: {\"confidence\": 0.0-1.0, \"hop_type\": \"single|multi|comparative\", "
+                    "\"is_judgment\": true|false, \"needs_clarification\": true|false, "
+                    "\"clarification_question\": \"question string or null\"}\n"
+                    "confidence: how unambiguously the query maps to a data lookup (1.0=crystal clear). "
+                    "Set needs_clarification=true ONLY when confidence < 0.65 AND the ambiguity would "
+                    "materially change the answer (e.g. 'cheap plants' — cheapest per unit? or lowest total?). "
+                    "hop_type: single=one query, multi=several queries chained, comparative=vendor vs vendor. "
+                    "is_judgment=true when answer requires expert opinion beyond data lookup."
+                )
+            }, {
+                "role": "user",
+                "content": f"Query: {query}"
+            }]
+        )
+        result = json.loads(resp.choices[0].message.content)
+        if result.get("confidence", 1.0) >= 0.65:
+            result["needs_clarification"] = False
+        return result
+    except Exception:
+        return {"confidence": 1.0, "hop_type": "single", "is_judgment": False,
+                "needs_clarification": False, "clarification_question": None}
+
+
+# ── Component 2: ExecutionPlan + replanning ───────────────────────────────────
+
+from dataclasses import dataclass, field as _dc_field
+
+
+@dataclass
+class ExecutionPlan:
+    query: str
+    intent: str
+    steps: list
+    complexity: dict
+    replan_count: int = 0
+    fallback_reason: str = ""
+
+
+def build_execution_plan(query: str, classification: dict, complexity: dict) -> "ExecutionPlan":
+    intent = classification.get("intent", "unknown")
+    hop_type = complexity.get("hop_type", "single")
+    steps: list[str]
+    if hop_type == "multi" or classification.get("step_count", 1) > 1:
+        steps = ["Retrieve base data", "Apply filters / aggregation", "Synthesise answer"]
+    elif intent == "spec_filter":
+        steps = ["Filter lines by spec constraints", "Fetch vendor prices for matches"]
+    elif intent == "rank_aggregate":
+        steps = ["Aggregate vendor quotes", "Rank by requested metric"]
+    elif intent == "visualization":
+        steps = ["Query data", "Render chart"]
+    elif intent in ("negotiation_analysis", "knowledge_botanical", "knowledge_availability"):
+        steps = ["Specialised analysis"]
+    else:
+        steps = ["Query database", "Synthesise answer"]
+    return ExecutionPlan(query=query, intent=intent, steps=steps, complexity=complexity)
+
+
+_ZERO_RESULT_MARKERS = [
+    "no results", "no vendors", "no data found", "no items", "not found",
+    "couldn't find", "could not find", "no matching", "zero results",
+    "no lines", "no records", "nothing found",
+]
+
+
+def execute_with_plan(plan: "ExecutionPlan", orig_history: list, rfx_id=None) -> tuple:
+    """
+    Run run_agent with the plan's intent_hint, replanning once on zero-result.
+    Returns (answer, new_history, tool_log).
+    Replanning fallback disclosure lands in the user-facing answer text.
+    """
+    intent_hint = plan.intent if plan.intent not in ("hybrid", "unknown", "off_topic") else None
+
+    answer, new_history, tool_log = run_agent(
+        plan.query, orig_history, rfx_id=rfx_id, intent_hint=intent_hint
+    )
+
+    ans_lower = answer.lower()
+    is_zero = any(m in ans_lower for m in _ZERO_RESULT_MARKERS)
+    all_errors = bool(tool_log) and all(t.get("error") for t in tool_log if t.get("tool") == "run_query")
+
+    if (is_zero or all_errors) and plan.replan_count < 2:
+        plan.replan_count += 1
+        answer2, new_history2, tool_log2 = run_agent(
+            plan.query, orig_history, rfx_id=rfx_id, intent_hint=None
+        )
+        ans2_lower = answer2.lower()
+        still_zero = any(m in ans2_lower for m in _ZERO_RESULT_MARKERS)
+        if not still_zero and len(answer2.strip()) > len(answer.strip()):
+            plan.fallback_reason = "line-item data unavailable"
+            return (
+                answer2 + "\n\n*Note: Line-item data wasn't available for this query — showing broader results.*",
+                new_history2,
+                tool_log2,
+            )
+
+    return answer, new_history, tool_log
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def classify_query(query: str, rfx_id: str | None = None) -> dict:
     """Stage 1: Classify intent + extract entities. Returns a classification dict."""
     q_lower = query.lower().strip()
@@ -1667,7 +1903,7 @@ def classify_query(query: str, rfx_id: str | None = None) -> dict:
                     "Classify a procurement analyst query. Return exactly this JSON schema:\n"
                     "{\n"
                     '  "intent": "spec_filter|name_lookup|rank_aggregate|visualization|negotiation_analysis'
-                    '|knowledge_botanical|knowledge_availability|off_topic|hybrid",\n'
+                    '|knowledge_botanical|knowledge_availability|version_check|off_topic|hybrid",\n'
                     '  "off_topic_sub_type": "chit_chat|frustration|meta_question|out_of_scope|null",\n'
                     '  "entities": {\n'
                     f'    "section": one of {sections} or null,\n'
@@ -1690,6 +1926,8 @@ def classify_query(query: str, rfx_id: str | None = None) -> dict:
                     "negotiation_analysis: overcharging, negotiation room, push back on vendor\n"
                     "knowledge_botanical: botanical traits — drought tolerance, growth rate, maintenance\n"
                     "knowledge_availability: regional supply — Jaipur/Rajasthan nurseries\n"
+                    "version_check: factual question about which document version / revision is active "
+                    "(e.g. 'does it include r1?', 'are you using the latest quote?', 'which version?')\n"
                     "off_topic: not related to procurement analysis\n"
                     "hybrid: combines two or more of the above"
                 )
@@ -1703,6 +1941,9 @@ def classify_query(query: str, rfx_id: str | None = None) -> dict:
         needs_confirm = intent in (
             "negotiation_analysis", "knowledge_botanical", "knowledge_availability"
         ) or (intent == "hybrid" and result.get("step_count", 1) > 1)
+        # version_check is a simple factual lookup — never needs plan confirmation
+        if intent == "version_check":
+            needs_confirm = False
         result["needs_confirmation"] = needs_confirm
         return result
     except Exception:
@@ -1747,6 +1988,12 @@ def generate_plan_text(classification: dict, rfx_id: str | None = None) -> str:
         return (
             f"You want to know which plants in your {section} BOQ can be sourced from "
             "Rajasthan nurseries. I'll do a quick web check and map the results to your vendor quotes."
+        )
+    elif intent == "version_check":
+        vendor_str = f" for {vendor}" if vendor else ""
+        return (
+            f"You want to verify which document version is currently active{vendor_str}. "
+            "I'll check the active source files in the database."
         )
     elif intent == "rank_aggregate":
         ranking = entities.get("ranking") or "lowest price"
@@ -2355,10 +2602,15 @@ def run_agent(
             "Do NOT call resolve_lines unless a specific plant name was mentioned."
         ),
         "visualization": (
-            "\nROUTING: visualization intent — the user wants a chart. "
-            "Call render_section_collage immediately with the active rfx_id. "
-            "Do NOT call run_query first. Do NOT use render_chart unless the user asked for a "
-            "specific single-metric or single-section drill-down. "
+            "\nROUTING: visualization intent — the user wants a chart.\n"
+            "GENERIC chart ('compare vendors', 'show a chart', 'visualise all sections'): "
+            "call render_section_collage immediately with the active rfx_id.\n"
+            "SPECIFIC subset chart ('top 5 most expensive', 'only trees', 'per-unit rates for X lines', "
+            "'cheapest N items'): call run_query first to get the data (see RULE J aggregation exception "
+            "for ranking queries — use ORDER BY normalized_unit_price LIMIT N, not resolve_lines), "
+            "then call render_chart with the result. "
+            "For a 'top/bottom N across vendors' chart: query avg unit price per line_id, "
+            "label bars with rl.item_name.\n"
             "After the chart renders, give a 2-3 sentence summary of what it shows."
         ),
     }
@@ -3844,6 +4096,44 @@ def _run_inbound_extraction(
         except Exception as e:
             errors.append(f"{fname}: {e}")
 
+    # After all files are processed, run a comprehensive dedup pass.
+    # The inline per-file dedup above can leave older source files active when
+    # multiple files for the same vendor are uploaded in the same batch and
+    # processed in an order where an older file path lands last. This pass
+    # resolves any remaining duplicates by keeping only the newest extracted_at
+    # row per (vendor_id, rfx_id, line_id) combination.
+    if n_extracted > 0:
+        try:
+            conn = _db_conn()
+            conn.execute("""
+                UPDATE vendor_extractions
+                SET superseded_by = (
+                    SELECT ve2.source_file
+                    FROM vendor_extractions ve2
+                    WHERE ve2.vendor_id   = vendor_extractions.vendor_id
+                      AND ve2.rfx_id      = vendor_extractions.rfx_id
+                      AND ve2.line_id     = vendor_extractions.line_id
+                      AND ve2.source_file != vendor_extractions.source_file
+                      AND (ve2.superseded_by IS NULL OR ve2.superseded_by = '')
+                    ORDER BY ve2.extracted_at DESC
+                    LIMIT 1
+                )
+                WHERE (superseded_by IS NULL OR superseded_by = '')
+                  AND EXISTS (
+                    SELECT 1 FROM vendor_extractions ve2
+                    WHERE ve2.vendor_id   = vendor_extractions.vendor_id
+                      AND ve2.rfx_id      = vendor_extractions.rfx_id
+                      AND ve2.line_id     = vendor_extractions.line_id
+                      AND ve2.source_file != vendor_extractions.source_file
+                      AND (ve2.superseded_by IS NULL OR ve2.superseded_by = '')
+                      AND ve2.extracted_at > vendor_extractions.extracted_at
+                  )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
     return n_extracted, errors
 
 
@@ -4618,10 +4908,23 @@ def _scorecard_data(rfx_id: str | None = None):
         else:
             totals = pd.DataFrame({'vendor_id': active_vendors,
                                    'common_total': [None] * len(active_vendors)})
+
+        # Full quote total — all lines the vendor priced, not just the common subset
+        full_totals = pd.read_sql_query(
+            f"SELECT ve.vendor_id, SUM(ve.normalized_unit_price * rl.quantity) AS full_total "
+            f"FROM vendor_extractions ve "
+            f"JOIN rfx_lines rl ON ve.line_id = rl.line_id "
+            f"WHERE ve.vendor_id IN ('{vlist_sql}') "
+            f"  AND ve.value_source != 'unknown' "
+            f"  AND (ve.superseded_by IS NULL OR ve.superseded_by = '') {rfx_clause_ve} "
+            f"GROUP BY ve.vendor_id",
+            conn, params=list(rfx_p),
+        )
+        totals = totals.merge(full_totals, on='vendor_id', how='left')
     else:
         common = pd.DataFrame({'line_id': []})
         n_common = 0
-        totals = pd.DataFrame({'vendor_id': [], 'common_total': []})
+        totals = pd.DataFrame({'vendor_id': [], 'common_total': [], 'full_total': []})
 
     anomaly = pd.read_sql_query(
         f"SELECT vendor_id, COUNT(*) AS anomaly_count "
@@ -4669,6 +4972,9 @@ def _scorecard_data(rfx_id: str | None = None):
     df['anomaly_count'] = df['anomaly_count'].fillna(0).astype(int)
     df['coverage_pct']  = (df['lines_quoted'] / max(n_total_lines, 1) * 100).round(1)
     df['common_total_fmt'] = df['common_total'].apply(
+        lambda x: f"₹{x:,.0f}" if pd.notna(x) else '—'
+    )
+    df['full_total_fmt'] = df['full_total'].apply(
         lambda x: f"₹{x:,.0f}" if pd.notna(x) else '—'
     )
     for col in ('q_pass', 'q_fail', 'q_ambig', 'q_noresp'):
@@ -5063,10 +5369,10 @@ with tab_chat:
                     st.session_state.pending_plan = None
                     st.rerun()
             with _pc2:
-                # Pre-fill with the agent's interpretation so the analyst
-                # corrects the understanding, not re-types the raw query
+                # Pre-fill with the original question so the analyst corrects
+                # what they asked, not the agent's restatement of it
                 _mod_query = st.text_input(
-                    "Correct my understanding:", value=_plan_data["plan_text"],
+                    "Correct your question:", value=_plan_data["query"],
                     key="plan_modify_input", label_visibility="collapsed",
                 )
             with _pc3:
@@ -5103,6 +5409,14 @@ with tab_chat:
         intent = classification.get("intent", "unknown")
         entities = classification.get("entities", {})
 
+        # ── Stage 1b: Complexity assessment ───────────────────────────────────
+        complexity: dict = {}
+        if intent not in ("off_topic", "unknown") and pre_classification is None:
+            try:
+                complexity = assess_query_complexity(user_input, st.session_state.history)
+            except Exception:
+                pass
+
         # ── Stage 2: Handle off_topic immediately (no tool loop) ──────────────
         if intent == "off_topic":
             answer = handle_off_topic(classification, user_input, rfx_id)
@@ -5124,19 +5438,33 @@ with tab_chat:
 
         else:
             # ── Stage 3: Plan confirmation ────────────────────────────────────
+            _already_resolved = _ambiguity_already_resolved(st.session_state.history)
+            _clarification_needed = (
+                not _already_resolved
+                and bool(complexity.get("needs_clarification"))
+                and bool(complexity.get("clarification_question"))
+            )
             needs_confirm = (
                 pre_classification is None  # already confirmed if execute_plan was set
-                and classification.get("needs_confirmation", False)
+                and not _already_resolved
+                and (
+                    classification.get("needs_confirmation", False)
+                    or _clarification_needed
+                )
             )
 
             if needs_confirm:
-                plan_text = generate_plan_text(classification, rfx_id)
+                if _clarification_needed:
+                    plan_text = complexity["clarification_question"]
+                    plan_msg = f"💬 {plan_text}"
+                else:
+                    plan_text = generate_plan_text(classification, rfx_id)
+                    plan_msg = f"📋 **Here's what I understood** — confirm below or correct me:\n\n{plan_text}"
                 st.session_state.pending_plan = {
                     "classification": classification,
                     "plan_text": plan_text,
                     "query": user_input,
                 }
-                plan_msg = f"📋 **Here's what I understood** — confirm below or correct me:\n\n{plan_text}"
                 with st.chat_message("assistant"):
                     st.markdown(plan_msg)
                 st.session_state.messages.append({
@@ -5146,6 +5474,7 @@ with tab_chat:
 
             # ── Stage 4: Route + Execute ──────────────────────────────────────
             plan_shown = execute_plan is not None
+            _exec_plan = build_execution_plan(user_input, classification, complexity)
 
             with st.chat_message("assistant"):
                 with st.spinner("Querying..."):
@@ -5174,29 +5503,27 @@ with tab_chat:
                             {"role": "assistant", "content": answer},
                         ]
 
-                    elif intent == "spec_filter":
-                        answer, new_history, tool_log = run_agent(
-                            user_input, st.session_state.history,
-                            rfx_id=rfx_id, intent_hint="spec_filter",
-                        )
-
-                    elif intent == "rank_aggregate":
-                        answer, new_history, tool_log = run_agent(
-                            user_input, st.session_state.history,
-                            rfx_id=rfx_id, intent_hint="rank_aggregate",
-                        )
-
-                    elif intent == "visualization":
-                        answer, new_history, tool_log = run_agent(
-                            user_input, st.session_state.history,
-                            rfx_id=rfx_id, intent_hint="visualization",
-                        )
-
                     else:
-                        # name_lookup, hybrid, unknown → full tool-loop autonomy
-                        answer, new_history, tool_log = run_agent(
-                            user_input, st.session_state.history, rfx_id=rfx_id
+                        # spec_filter, rank_aggregate, visualization, name_lookup, hybrid, unknown
+                        # — all go through execute_with_plan for zero-result replanning
+                        answer, new_history, tool_log = execute_with_plan(
+                            _exec_plan, st.session_state.history, rfx_id=rfx_id
                         )
+
+                # ── Grounding check (deterministic, non-blocking) ─────────────
+                try:
+                    _gc_conn = _db_conn()
+                    _gr = run_grounding_check(answer, tool_log, _gc_conn)
+                    _gc_conn.close()
+                    if _gr["unchecked_numbers"]:
+                        _unc_list = ", ".join(_gr["unchecked_numbers"][:5])
+                        answer += (
+                            "\n\n---\n*⚠️ The following figures could not be verified "
+                            f"against query results (composite or derived values — "
+                            f"treat as unverified): {_unc_list}*"
+                        )
+                except Exception:
+                    pass  # grounding check never blocks the answer
 
                 _ans_embedded = _DATA_URI_RE.findall(answer)
                 if _ans_embedded:
