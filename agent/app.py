@@ -599,19 +599,45 @@ def _schema_summary() -> str:
                rl.quantity, rl.unit, rl.boq_unit_rate
         FROM rfx_lines rl WHERE rl.line_id = '<resolved_id>'
 
-    RULE L — Coverage gate before award or optimisation recommendations:
-      Before making any recommendation that names a preferred vendor (awarding, shortlisting,
-      eliminating, or ranking vendors for selection), you MUST:
-      1. Run a coverage check: report each vendor's lines_quoted / total_rfx_lines as a %.
-      2. If ANY vendor has < 60% coverage, show a ⚠️ warning before the recommendation:
-         "⚠️ [Vendor] covers only X% of RFx lines — a full award comparison requires
-         imputed prices for the remaining Y lines or separate negotiation on those items."
-      3. Label all totals with their line scope — NEVER present a partial-coverage total as
-         if it were a full quote. Use e.g. "common-lines total (34/69 lines quoted by all)".
-      4. If the user explicitly asks for a recommendation despite low coverage, give it —
-         but the coverage caveat must still appear before the verdict.
-      This rule applies to: "who should I award to", "best vendor", "eliminate vendor",
-      "optimise cost", "which vendor wins", and any equivalent phrasing.
+    RULE L — Coverage gate: vendors must quote ≥70% of section lines to be "qualified":
+      A vendor is only QUALIFIED for a section if they quoted ≥70% of that section's RFx lines.
+      This applies to ALL cheapest/optimisation/award queries — not just warnings.
+
+      MANDATORY: For any "cheapest vendor per section", "optimise award", "who should I award",
+      or "cheapest qualified vendor" query, you MUST filter out under-coverage vendors in SQL
+      BEFORE ranking. Use this CTE pattern:
+
+        WITH section_totals AS (
+          SELECT rl.section, COUNT(DISTINCT rl.line_id) AS total_lines
+          FROM rfx_lines rl WHERE rl.rfx_id = ?
+          GROUP BY rl.section
+        ),
+        vendor_coverage AS (
+          SELECT ve.vendor_id, ve.vendor_name, rl.section,
+                 COUNT(DISTINCT ve.line_id) AS quoted_lines,
+                 st.total_lines,
+                 ROUND(COUNT(DISTINCT ve.line_id) * 1.0 / st.total_lines, 2) AS coverage
+          FROM vendor_extractions ve
+          JOIN rfx_lines rl ON ve.line_id = rl.line_id
+          JOIN section_totals st ON rl.section = st.section
+          WHERE ve.rfx_id = ? AND (ve.superseded_by IS NULL OR ve.superseded_by = '')
+          GROUP BY ve.vendor_id, rl.section
+        ),
+        qualified AS (
+          SELECT vendor_id, section FROM vendor_coverage WHERE coverage >= 0.7
+        )
+        -- Then JOIN to qualified in the main price query
+
+      NEVER rank or recommend a vendor as cheapest for a section unless they appear in the
+      qualified CTE. If fewer than 2 vendors are qualified for a section, report that explicitly
+      ("Only 1 vendor meets the 70% coverage threshold for [section]") — do not use unqualified
+      vendors to fill the gap.
+
+      After filtering, show a coverage table alongside results:
+        | Vendor | Section | Quoted | Total | Coverage | Qualified? |
+
+      If the user explicitly asks to include low-coverage vendors anyway, do so but label them
+      ⚠️ UNQUALIFIED and put them in a separate table below the qualified results.
 
     IMPORTANT — text/keyword search across rfx_lines:
       Always use the 'search_text' column for any text/keyword search on rfx_lines.
@@ -2603,7 +2629,9 @@ def run_agent(
         ),
         "rank_aggregate": (
             "\nROUTING: rank_aggregate intent — use aggregate SQL (GROUP BY, ORDER BY) directly. "
-            "Do NOT call resolve_lines unless a specific plant name was mentioned."
+            "Do NOT call resolve_lines unless a specific plant name was mentioned.\n"
+            "For cheapest/best-vendor/award queries: apply RULE L coverage gate (≥70% of section "
+            "lines quoted) — filter unqualified vendors out of SQL before ranking, do not just warn."
         ),
         "data_quality": (
             "\nROUTING: data_quality intent — query extraction confidence and completeness metrics. "
