@@ -1903,7 +1903,7 @@ def classify_query(query: str, rfx_id: str | None = None) -> dict:
                     "Classify a procurement analyst query. Return exactly this JSON schema:\n"
                     "{\n"
                     '  "intent": "spec_filter|name_lookup|rank_aggregate|visualization|negotiation_analysis'
-                    '|knowledge_botanical|knowledge_availability|version_check|off_topic|hybrid",\n'
+                    '|knowledge_botanical|knowledge_availability|version_check|data_quality|off_topic|hybrid",\n'
                     '  "off_topic_sub_type": "chit_chat|frustration|meta_question|out_of_scope|null",\n'
                     '  "entities": {\n'
                     f'    "section": one of {sections} or null,\n'
@@ -1928,6 +1928,10 @@ def classify_query(query: str, rfx_id: str | None = None) -> dict:
                     "knowledge_availability: regional supply — Jaipur/Rajasthan nurseries\n"
                     "version_check: factual question about which document version / revision is active "
                     "(e.g. 'does it include r1?', 'are you using the latest quote?', 'which version?')\n"
+                    "data_quality: question about extraction reliability, vendor quote completeness, "
+                    "confidence scores, missing lines, photo vs written quotes, or which vendor to "
+                    "exclude based on data quality (e.g. 'eliminate vendor on data quality', 'which vendor "
+                    "has lowest confidence', 'how complete is their quote')\n"
                     "off_topic: not related to procurement analysis\n"
                     "hybrid: combines two or more of the above"
                 )
@@ -1941,8 +1945,8 @@ def classify_query(query: str, rfx_id: str | None = None) -> dict:
         needs_confirm = intent in (
             "negotiation_analysis", "knowledge_botanical", "knowledge_availability"
         ) or (intent == "hybrid" and result.get("step_count", 1) > 1)
-        # version_check is a simple factual lookup — never needs plan confirmation
-        if intent == "version_check":
+        # version_check and data_quality are factual lookups — never need plan confirmation
+        if intent in ("version_check", "data_quality"):
             needs_confirm = False
         result["needs_confirmation"] = needs_confirm
         return result
@@ -2600,6 +2604,21 @@ def run_agent(
         "rank_aggregate": (
             "\nROUTING: rank_aggregate intent — use aggregate SQL (GROUP BY, ORDER BY) directly. "
             "Do NOT call resolve_lines unless a specific plant name was mentioned."
+        ),
+        "data_quality": (
+            "\nROUTING: data_quality intent — query extraction confidence and completeness metrics. "
+            "Do NOT run price comparison SQL. Instead query:\n"
+            "  SELECT vendor_id, vendor_name,\n"
+            "    COUNT(*) AS total_rows,\n"
+            "    ROUND(AVG(extraction_confidence),2) AS avg_confidence,\n"
+            "    SUM(CASE WHEN matched=1 THEN 1 ELSE 0 END) AS matched_lines,\n"
+            "    SUM(CASE WHEN value_source='unknown' THEN 1 ELSE 0 END) AS missing_lines,\n"
+            "    SUM(CASE WHEN extraction_confidence < 0.7 THEN 1 ELSE 0 END) AS low_conf_lines\n"
+            "  FROM vendor_extractions\n"
+            "  WHERE rfx_id=? AND (superseded_by IS NULL OR superseded_by='')\n"
+            "  GROUP BY vendor_id, vendor_name ORDER BY avg_confidence ASC\n"
+            "Also check source_file for 'photo' to flag photo quotes (lower quality).\n"
+            "Report: per-vendor avg confidence, % lines matched, missing lines, photo vs written."
         ),
         "visualization": (
             "\nROUTING: visualization intent — the user wants a chart.\n"
@@ -5470,6 +5489,9 @@ with tab_chat:
                 st.session_state.messages.append({
                     "role": "assistant", "content": plan_msg, "tool_log": []
                 })
+                # Must be in history so _ambiguity_already_resolved detects the ?-ending
+                # on the user's next turn and prevents a second clarification question.
+                st.session_state.history.append({"role": "assistant", "content": plan_msg})
                 st.rerun()
 
             # ── Stage 4: Route + Execute ──────────────────────────────────────
@@ -5484,6 +5506,12 @@ with tab_chat:
                             {"role": "user", "content": user_input},
                             {"role": "assistant", "content": answer},
                         ]
+
+                    elif intent == "data_quality":
+                        answer, new_history, tool_log = run_agent(
+                            user_input, st.session_state.history, rfx_id,
+                            intent_hint="data_quality"
+                        )
 
                     elif intent == "knowledge_botanical":
                         answer, tool_log = execute_knowledge_botanical(
